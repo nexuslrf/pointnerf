@@ -2,10 +2,6 @@ import os
 import numpy as np
 from numpy import dot
 from math import sqrt
-import pycuda
-from pycuda.compiler import SourceModule
-import pycuda.driver as drv
-import pycuda.gpuarray as gpuarray
 import matplotlib.pyplot as plt
 import torch
 import pickle
@@ -13,18 +9,17 @@ import time
 from models.rendering.diff_ray_marching import near_far_linear_ray_generation, near_far_disparity_linear_ray_generation
 
 from data.load_blender import load_blender_data
-
+try:
+    from models.neural_points.c_ext import _ext
+except:
+    # print with red color
+    print("Please run: " +
+          "\033[1;31m`cd models/neural_points/c_ext; python setup.py build_ext --inplace; cd -`\033[0m" + 
+          " to compile the C++ extensions.")
+    exit(1)
 # X = torch.cuda.FloatTensor(8)
 
 
-class Holder(pycuda.driver.PointerHolderBase):
-    def __init__(self, t):
-        super(Holder, self).__init__()
-        self.t = t
-        self.gpudata = t.data_ptr()
-
-    def get_pointer(self):
-        return self.t.data_ptr()
 
 class lighting_fast_querier():
 
@@ -33,15 +28,8 @@ class lighting_fast_querier():
         print("querier device", device, device.index)
         self.gpu = device.index
         self.opt = opt
-        drv.init()
-        # self.device = drv.Device(gpu)
-        self.ctx = drv.Device(self.gpu).make_context()
-        self.claim_occ, self.map_coor2occ, self.fill_occ2pnts, self.mask_raypos, self.get_shadingloc, self.query_along_ray = self.build_cuda()
         self.inverse = self.opt.inverse
         self.count=0
-
-    def clean_up(self):
-        self.ctx.pop()
 
     def get_hyperparameters(self, vsize_np, point_xyz_w_tensor, ranges=None):
         '''
@@ -69,24 +57,43 @@ class lighting_fast_querier():
         vdim_np = (max_xyz - min_xyz).cpu().numpy() / vsize_np
 
         scaled_vdim_np = np.ceil(vdim_np / vscale_np).astype(np.int32)
-        ranges_gpu, scaled_vsize_gpu, scaled_vdim_gpu, vscale_gpu, kernel_size_gpu, query_size_gpu = np_to_gpuarray(
-            ranges_np, scaled_vsize_np, scaled_vdim_np, vscale_np, np.asarray(self.opt.kernel_size, dtype=np.int32),
-            np.asarray(self.opt.query_size, dtype=np.int32))
+        ranges_gpu, scaled_vsize_gpu, scaled_vdim_gpu, vscale_gpu, kernel_size_gpu, query_size_gpu = \
+            [
+                torch.from_numpy(array).to(min_xyz.device)
+                for array in 
+                [
+                    ranges_np, scaled_vsize_np, scaled_vdim_np, vscale_np, 
+                    np.asarray(self.opt.kernel_size, dtype=np.int32),
+                    np.asarray(self.opt.query_size, dtype=np.int32)
+                ]
+            ]
 
         radius_limit_np, depth_limit_np = self.opt.radius_limit_scale * max(vsize_np[0], vsize_np[1]), self.opt.depth_limit_scale * vsize_np[2]
-        return np.asarray(radius_limit_np).astype(np.float32), np.asarray(depth_limit_np).astype(np.float32), ranges_np, vsize_np, vdim_np, scaled_vsize_np, scaled_vdim_np, vscale_np, ranges_gpu, scaled_vsize_gpu, scaled_vdim_gpu, vscale_gpu, kernel_size_gpu, query_size_gpu
+        return np.asarray(radius_limit_np).astype(np.float32), np.asarray(depth_limit_np).astype(np.float32), \
+                ranges_np, vsize_np, vdim_np, scaled_vsize_np, scaled_vdim_np, vscale_np, \
+                ranges_gpu, scaled_vsize_gpu, scaled_vdim_gpu, vscale_gpu, kernel_size_gpu, query_size_gpu
 
 
     def query_points(self, pixel_idx_tensor, point_xyz_pers_tensor, point_xyz_w_tensor, actual_numpoints_tensor, h, w, intrinsic, near_depth, far_depth, ray_dirs_tensor, cam_pos_tensor, cam_rot_tensor):
         near_depth, far_depth = np.asarray(near_depth).item() , np.asarray(far_depth).item()
-        radius_limit_np, depth_limit_np, ranges_np, vsize_np, vdim_np, scaled_vsize_np, scaled_vdim_np, vscale_np, range_gpu, scaled_vsize_gpu, scaled_vdim_gpu, vscale_gpu, kernel_size_gpu, query_size_gpu = self.get_hyperparameters(self.opt.vsize, point_xyz_w_tensor, ranges=self.opt.ranges)
+        radius_limit_np, depth_limit_np, ranges_np, vsize_np, vdim_np, scaled_vsize_np, scaled_vdim_np, vscale_np, \
+            range_gpu, scaled_vsize_gpu, scaled_vdim_gpu, vscale_gpu, kernel_size_gpu, query_size_gpu \
+                = self.get_hyperparameters(self.opt.vsize, point_xyz_w_tensor, ranges=self.opt.ranges)
         # print("self.opt.ranges", self.opt.ranges, range_gpu, ray_dirs_tensor)
         if self.opt.inverse > 0:
             raypos_tensor, _, _, _ = near_far_disparity_linear_ray_generation(cam_pos_tensor, ray_dirs_tensor, self.opt.z_depth_dim, near=near_depth, far=far_depth, jitter=0.3 if self.opt.is_train > 0 else 0.)
         else:
             raypos_tensor, _, _, _ = near_far_linear_ray_generation(cam_pos_tensor, ray_dirs_tensor, self.opt.z_depth_dim, near=near_depth, far=far_depth, jitter=0.3 if self.opt.is_train > 0 else 0.)
 
-        sample_pidx_tensor, sample_loc_w_tensor, ray_mask_tensor = self.query_grid_point_index(h, w, pixel_idx_tensor, raypos_tensor, point_xyz_w_tensor, actual_numpoints_tensor, kernel_size_gpu, query_size_gpu, self.opt.SR, self.opt.K, ranges_np, scaled_vsize_np, scaled_vdim_np, vscale_np, self.opt.max_o, self.opt.P, radius_limit_np, depth_limit_np, range_gpu, scaled_vsize_gpu, scaled_vdim_gpu, vscale_gpu, ray_dirs_tensor, cam_pos_tensor, kMaxThreadsPerBlock=self.opt.gpu_maxthr)
+        sample_pidx_tensor, sample_loc_w_tensor, ray_mask_tensor = \
+            self.query_grid_point_index(
+                h, w, pixel_idx_tensor, raypos_tensor, point_xyz_w_tensor, actual_numpoints_tensor, 
+                kernel_size_gpu, query_size_gpu, 
+                self.opt.SR, self.opt.K, 
+                ranges_np, scaled_vsize_np, scaled_vdim_np, vscale_np, 
+                self.opt.max_o, self.opt.P, radius_limit_np, depth_limit_np, 
+                range_gpu, scaled_vsize_gpu, scaled_vdim_gpu, vscale_gpu, 
+                ray_dirs_tensor, cam_pos_tensor, kMaxThreadsPerBlock=self.opt.gpu_maxthr)
 
         sample_ray_dirs_tensor = torch.masked_select(ray_dirs_tensor, ray_mask_tensor[..., None]>0).reshape(ray_dirs_tensor.shape[0],-1,3)[...,None,:].expand(-1, -1, self.opt.SR, -1).contiguous()
         # print("sample_ray_dirs_tensor", sample_ray_dirs_tensor.shape)
@@ -102,440 +109,10 @@ class lighting_fast_querier():
         y_pers = xyz_c[..., 1] / xyz_c[..., 2]
         return torch.stack([x_pers, y_pers, z_pers], dim=-1)
 
-
-    def build_cuda(self):
-
-        mod = SourceModule(
-            """
-            #define KN  """ + str(self.opt.K)
-            + """ 
-            #include <cuda.h>
-            #include <cuda_runtime.h>
-            #include <algorithm>
-            #include <vector>
-            #include <stdio.h>
-            #include <math.h>
-            #include <stdlib.h>
-            #include <curand_kernel.h>
-            namespace cuda {          
-    
-                static __device__ inline uint8_t atomicAdd(uint8_t *address, uint8_t val) {
-                    size_t offset = (size_t)address & 3;
-                    uint32_t *address_as_ui = (uint32_t *)(address - offset);
-                    uint32_t old = *address_as_ui;
-                    uint32_t shift = offset * 8;
-                    uint32_t old_byte;
-                    uint32_t newval;
-                    uint32_t assumed;
-    
-                    do {
-                      assumed = old;
-                      old_byte = (old >> shift) & 0xff;
-                      // preserve size in initial cast. Casting directly to uint32_t pads
-                      // negative signed values with 1's (e.g. signed -1 = unsigned ~0).
-                      newval = static_cast<uint8_t>(val + old_byte);
-                      newval = (old & ~(0x000000ff << shift)) | (newval << shift);
-                      old = atomicCAS(address_as_ui, assumed, newval);
-                    } while (assumed != old);
-                    return __byte_perm(old, 0, offset);   // need validate
-                }
-    
-                static __device__ inline char atomicAdd(char* address, char val) {
-                    // offset, in bytes, of the char* address within the 32-bit address of the space that overlaps it
-                    size_t long_address_modulo = (size_t) address & 3;
-                    // the 32-bit address that overlaps the same memory
-                    auto* base_address = (unsigned int*) ((char*) address - long_address_modulo);
-                    // A 0x3210 selector in __byte_perm will simply select all four bytes in the first argument in the same order.
-                    // The "4" signifies the position where the first byte of the second argument will end up in the output.
-                    unsigned int selectors[] = {0x3214, 0x3240, 0x3410, 0x4210};
-                    // for selecting bytes within a 32-bit chunk that correspond to the char* address (relative to base_address)
-                    unsigned int selector = selectors[long_address_modulo];
-                    unsigned int long_old, long_assumed, long_val, replacement;
-    
-                    long_old = *base_address;
-    
-                    do {
-                        long_assumed = long_old;
-                        // replace bits in long_old that pertain to the char address with those from val
-                        long_val = __byte_perm(long_old, 0, long_address_modulo) + val;
-                        replacement = __byte_perm(long_old, long_val, selector);
-                        long_old = atomicCAS(base_address, long_assumed, replacement);
-                    } while (long_old != long_assumed);
-                    return __byte_perm(long_old, 0, long_address_modulo);
-                }            
-    
-                static __device__ inline int8_t atomicAdd(int8_t *address, int8_t val) {
-                    return (int8_t)cuda::atomicAdd((char*)address, (char)val);
-                }
-    
-                static __device__ inline short atomicAdd(short* address, short val)
-                {
-    
-                    unsigned int *base_address = (unsigned int *)((size_t)address & ~2);
-    
-                    unsigned int long_val = ((size_t)address & 2) ? ((unsigned int)val << 16) : (unsigned short)val;
-    
-                    unsigned int long_old = ::atomicAdd(base_address, long_val);
-    
-                    if((size_t)address & 2) {
-                        return (short)(long_old >> 16);
-                    } else {
-    
-                        unsigned int overflow = ((long_old & 0xffff) + long_val) & 0xffff0000;
-    
-                        if (overflow)
-    
-                            atomicSub(base_address, overflow);
-    
-                        return (short)(long_old & 0xffff);
-                    }
-                }
-    
-                static __device__ float cas(double *addr, double compare, double val) {
-                   unsigned long long int *address_as_ull = (unsigned long long int *) addr;
-                   return __longlong_as_double(atomicCAS(address_as_ull,
-                                                 __double_as_longlong(compare),
-                                                 __double_as_longlong(val)));
-                }
-    
-                static __device__ float cas(float *addr, float compare, float val) {
-                    unsigned int *address_as_uint = (unsigned int *) addr;
-                    return __uint_as_float(atomicCAS(address_as_uint,
-                                           __float_as_uint(compare),
-                                           __float_as_uint(val)));
-                }
-    
-    
-    
-                static __device__ inline uint8_t atomicCAS(uint8_t * const address, uint8_t const compare, uint8_t const value)
-                {
-                    uint8_t const longAddressModulo = reinterpret_cast< size_t >( address ) & 0x3;
-                    uint32_t *const baseAddress  = reinterpret_cast< uint32_t * >( address - longAddressModulo );
-                    uint32_t constexpr byteSelection[] = { 0x3214, 0x3240, 0x3410, 0x4210 }; // The byte position we work on is '4'.
-                    uint32_t const byteSelector = byteSelection[ longAddressModulo ];
-                    uint32_t const longCompare = compare;
-                    uint32_t const longValue = value;
-                    uint32_t longOldValue = * baseAddress;
-                    uint32_t longAssumed;
-                    uint8_t oldValue;
-                    do {
-                        // Select bytes from the old value and new value to construct a 32-bit value to use.
-                        uint32_t const replacement = __byte_perm( longOldValue, longValue,   byteSelector );
-                        uint32_t const comparison  = __byte_perm( longOldValue, longCompare, byteSelector );
-    
-                        longAssumed  = longOldValue;
-                        // Use 32-bit atomicCAS() to try and set the 8-bits we care about.
-                        longOldValue = ::atomicCAS( baseAddress, comparison, replacement );
-                        // Grab the 8-bit portion we care about from the old value at address.
-                        oldValue     = ( longOldValue >> ( 8 * longAddressModulo )) & 0xFF;
-                    } while ( compare == oldValue and longAssumed != longOldValue ); // Repeat until other three 8-bit values stabilize.
-                    return oldValue;
-                }
-            }
-    
-            extern "C" {
-                __global__ void claim_occ(
-                    const float* in_data,   // B * N * 3
-                    const int* in_actual_numpoints, // B 
-                    const int B,
-                    const int N,
-                    const float *d_coord_shift,     // 3
-                    const float *d_voxel_size,      // 3
-                    const int *d_grid_size,       // 3
-                    const int grid_size_vol,
-                    const int max_o,
-                    int* occ_idx, // B, all 0
-                    int *coor_2_occ,  // B * 400 * 400 * 400, all -1
-                    int *occ_2_coor,  // B * max_o * 3, all -1
-                    unsigned long seconds
-                ) {
-                    int index = blockIdx.x * blockDim.x + threadIdx.x; // index of gpu thread
-                    int i_batch = index / N;  // index of batch
-                    if (i_batch >= B) { return; }
-                    int i_pt = index - N * i_batch;
-                    if (i_pt < in_actual_numpoints[i_batch]) {
-                        int coor[3];
-                        const float *p_pt = in_data + index * 3;
-                        coor[0] = (int) floor((p_pt[0] - d_coord_shift[0]) / d_voxel_size[0]);
-                        coor[1] = (int) floor((p_pt[1] - d_coord_shift[1]) / d_voxel_size[1]);
-                        coor[2] = (int) floor((p_pt[2] - d_coord_shift[2]) / d_voxel_size[2]);
-                        // printf("p_pt %f %f %f %f; ", p_pt[2], d_coord_shift[2], d_coord_shift[0], d_coord_shift[1]);
-                        if (coor[0] < 0 || coor[0] >= d_grid_size[0] || coor[1] < 0 || coor[1] >= d_grid_size[1] || coor[2] < 0 || coor[2] >= d_grid_size[2]) { return; }
-                        int coor_indx_b = i_batch * grid_size_vol + coor[0] * (d_grid_size[1] * d_grid_size[2]) + coor[1] * d_grid_size[2] + coor[2];
-                        
-                        int voxel_idx = coor_2_occ[coor_indx_b];
-                        if (voxel_idx == -1) {  // found an empty voxel
-                            int old_voxel_num = atomicCAS(
-                                    &coor_2_occ[coor_indx_b],
-                                    -1, 0
-                            );
-                            if (old_voxel_num == -1) {
-                                // CAS -> old val, if old val is -1
-                                // if we get -1, this thread is the one who obtain a new voxel
-                                // so only this thread should do the increase operator below
-                                int tmp = atomicAdd(occ_idx+i_batch, 1); // increase the counter, return old counter
-                                 // increase the counter, return old counter
-                                if (tmp < max_o) {
-                                    int coord_inds = (i_batch * max_o + tmp) * 3;
-                                    occ_2_coor[coord_inds] = coor[0];
-                                    occ_2_coor[coord_inds + 1] = coor[1];
-                                    occ_2_coor[coord_inds + 2] = coor[2];
-                                } else {
-                                    curandState state;
-                                    curand_init(index+2*seconds, 0, 0, &state);
-                                    int insrtidx = ceilf(curand_uniform(&state) * (tmp+1)) - 1;
-                                    if(insrtidx < max_o){
-                                        int coord_inds = (i_batch * max_o + insrtidx) * 3;
-                                        occ_2_coor[coord_inds] = coor[0];
-                                        occ_2_coor[coord_inds + 1] = coor[1];
-                                        occ_2_coor[coord_inds + 2] = coor[2];
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                __global__ void map_coor2occ(
-                    const int B,
-                    const int *d_grid_size,       // 3
-                    const int *kernel_size,       // 3
-                    const int grid_size_vol,
-                    const int max_o,
-                    int* occ_idx, // B, all -1
-                    int *coor_occ,  // B * 400 * 400 * 400
-                    int *coor_2_occ,  // B * 400 * 400 * 400
-                    int *occ_2_coor  // B * max_o * 3
-                ) {
-                    int index = blockIdx.x * blockDim.x + threadIdx.x; // index of gpu thread
-                    int i_batch = index / max_o;  // index of batch
-                    if (i_batch >= B) { return; }
-                    int i_pt = index - max_o * i_batch;
-                    if (i_pt < occ_idx[i_batch] && i_pt < max_o) {
-                        int coor[3];
-                        coor[0] = occ_2_coor[index*3];
-                        if (coor[0] < 0) { return; }
-                        coor[1] = occ_2_coor[index*3+1];
-                        coor[2] = occ_2_coor[index*3+2];
-                        
-                        int coor_indx_b = i_batch * grid_size_vol + coor[0] * (d_grid_size[1] * d_grid_size[2]) + coor[1] * d_grid_size[2] + coor[2];
-                        coor_2_occ[coor_indx_b] = i_pt;
-                        // printf("kernel_size[0] %d", kernel_size[0]);
-                        for (int coor_x = max(0, coor[0] - kernel_size[0] / 2) ; coor_x < min(d_grid_size[0], coor[0] + (kernel_size[0] + 1) / 2); coor_x++)    {
-                            for (int coor_y = max(0, coor[1] - kernel_size[1] / 2) ; coor_y < min(d_grid_size[1], coor[1] + (kernel_size[1] + 1) / 2); coor_y++)   {
-                                for (int coor_z = max(0, coor[2] - kernel_size[2] / 2) ; coor_z < min(d_grid_size[2], coor[2] + (kernel_size[2] + 1) / 2); coor_z++) {
-                                    coor_indx_b = i_batch * grid_size_vol + coor_x * (d_grid_size[1] * d_grid_size[2]) + coor_y * d_grid_size[2] + coor_z;
-                                    if (coor_occ[coor_indx_b] > 0) { continue; }
-                                    atomicCAS(coor_occ + coor_indx_b, 0, 1);
-                                }
-                            }
-                        }   
-                    }
-                }
-                
-                __global__ void fill_occ2pnts(
-                    const float* in_data,   // B * N * 3
-                    const int* in_actual_numpoints, // B 
-                    const int B,
-                    const int N,
-                    const int P,
-                    const float *d_coord_shift,     // 3
-                    const float *d_voxel_size,      // 3
-                    const int *d_grid_size,       // 3
-                    const int grid_size_vol,
-                    const int max_o,
-                    int *coor_2_occ,  // B * 400 * 400 * 400, all -1
-                    int *occ_2_pnts,  // B * max_o * P, all -1
-                    int *occ_numpnts,  // B * max_o, all 0
-                    unsigned long seconds
-                ) {
-                    int index = blockIdx.x * blockDim.x + threadIdx.x; // index of gpu thread
-                    int i_batch = index / N;  // index of batch
-                    if (i_batch >= B) { return; }
-                    int i_pt = index - N * i_batch;
-                    if (i_pt < in_actual_numpoints[i_batch]) {
-                        int coor[3];
-                        const float *p_pt = in_data + index * 3;
-                        coor[0] = (int) floor((p_pt[0] - d_coord_shift[0]) / d_voxel_size[0]);
-                        coor[1] = (int) floor((p_pt[1] - d_coord_shift[1]) / d_voxel_size[1]);
-                        coor[2] = (int) floor((p_pt[2] - d_coord_shift[2]) / d_voxel_size[2]);
-                        if (coor[0] < 0 || coor[0] >= d_grid_size[0] || coor[1] < 0 || coor[1] >= d_grid_size[1] || coor[2] < 0 || coor[2] >= d_grid_size[2]) { return; }
-                        int coor_indx_b = i_batch * grid_size_vol + coor[0] * (d_grid_size[1] * d_grid_size[2]) + coor[1] * d_grid_size[2] + coor[2];
-                        
-                        int voxel_idx = coor_2_occ[coor_indx_b];
-                        if (voxel_idx > 0) {  // found an claimed coor2occ
-                            int occ_indx_b = i_batch * max_o + voxel_idx;
-                            int tmp = atomicAdd(occ_numpnts + occ_indx_b, 1); // increase the counter, return old counter
-                            if (tmp < P) {
-                                occ_2_pnts[occ_indx_b * P + tmp] = i_pt;
-                            } else {
-                                curandState state;
-                                curand_init(index+2*seconds, 0, 0, &state);
-                                int insrtidx = ceilf(curand_uniform(&state) * (tmp+1)) - 1;
-                                if(insrtidx < P){
-                                    occ_2_pnts[occ_indx_b * P + insrtidx] = i_pt;
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                            
-                __global__ void mask_raypos(
-                    float *raypos,    // [B, 2048, 400, 3]
-                    int *coor_occ,    // B * 400 * 400 * 400
-                    const int B,       // 3
-                    const int R,       // 3
-                    const int D,       // 3
-                    const int grid_size_vol,
-                    const float *d_coord_shift,     // 3
-                    const int *d_grid_size,       // 3
-                    const float *d_voxel_size,      // 3
-                    int *raypos_mask    // B, R, D
-                ) {
-                    int index = blockIdx.x * blockDim.x + threadIdx.x; // index of gpu thread
-                    int i_batch = index / (R * D);  // index of batch
-                    if (i_batch >= B) { return; }
-                    int coor[3];
-                    coor[0] = (int) floor((raypos[index*3] - d_coord_shift[0]) / d_voxel_size[0]);
-                    coor[1] = (int) floor((raypos[index*3+1] - d_coord_shift[1]) / d_voxel_size[1]);
-                    coor[2] = (int) floor((raypos[index*3+2] - d_coord_shift[2]) / d_voxel_size[2]);
-                    // printf(" %f %f %f;", raypos[index*3], raypos[index*3+1], raypos[index*3+2]);
-                    if ((coor[0] >= 0) && (coor[0] < d_grid_size[0]) && (coor[1] >= 0) && (coor[1] < d_grid_size[1]) && (coor[2] >= 0) && (coor[2] < d_grid_size[2])) { 
-                        int coor_indx_b = i_batch * grid_size_vol + coor[0] * (d_grid_size[1] * d_grid_size[2]) + coor[1] * d_grid_size[2] + coor[2];
-                        raypos_mask[index] = coor_occ[coor_indx_b];
-                    }
-                }
-                
-        
-                __global__ void get_shadingloc(
-                    const float *raypos,    // [B, 2048, 400, 3]
-                    const int *raypos_mask,    // B, R, D
-                    const int B,       // 3
-                    const int R,       // 3
-                    const int D,       // 3
-                    const int SR,       // 3
-                    float *sample_loc,       // B * R * SR * 3
-                    int *sample_loc_mask       // B * R * SR
-                ) {
-                    int index = blockIdx.x * blockDim.x + threadIdx.x; // index of gpu thread
-                    int i_batch = index / (R * D);  // index of batch
-                    if (i_batch >= B) { return; }
-                    int temp = raypos_mask[index];
-                    if (temp >= 0) {
-                        int r = (index - i_batch * R * D) / D;
-                        int loc_inds = i_batch * R * SR + r * SR + temp;
-                        sample_loc[loc_inds * 3] = raypos[index * 3];
-                        sample_loc[loc_inds * 3 + 1] = raypos[index * 3 + 1];
-                        sample_loc[loc_inds * 3 + 2] = raypos[index * 3 + 2];
-                        sample_loc_mask[loc_inds] = 1;
-                    }
-                }
-                
-                
-                __global__ void query_neigh_along_ray_layered(
-                    const float* in_data,   // B * N * 3
-                    const int B,
-                    const int SR,               // num. samples along each ray e.g., 128
-                    const int R,               // e.g., 1024
-                    const int max_o,
-                    const int P,
-                    const int K,                // num.  neighbors
-                    const int grid_size_vol,
-                    const float radius_limit2,
-                    const float *d_coord_shift,     // 3
-                    const int *d_grid_size,
-                    const float *d_voxel_size,      // 3
-                    const int *kernel_size,
-                    const int *occ_numpnts,    // B * max_o
-                    const int *occ_2_pnts,            // B * max_o * P
-                    const int *coor_2_occ,      // B * 400 * 400 * 400 
-                    const float *sample_loc,       // B * R * SR * 3
-                    const int *sample_loc_mask,       // B * R * SR
-                    int *sample_pidx,       // B * R * SR * K
-                    unsigned long seconds,
-                    const int NN
-                ) {
-                    int index =  blockIdx.x * blockDim.x + threadIdx.x; // index of gpu thread
-                    int i_batch = index / (R * SR);  // index of batch
-                    if (i_batch >= B || sample_loc_mask[index] <= 0) { return; }
-                    float centerx = sample_loc[index * 3];
-                    float centery = sample_loc[index * 3 + 1];
-                    float centerz = sample_loc[index * 3 + 2];
-                    int frustx = (int) floor((centerx - d_coord_shift[0]) / d_voxel_size[0]);
-                    int frusty = (int) floor((centery - d_coord_shift[1]) / d_voxel_size[1]);
-                    int frustz = (int) floor((centerz - d_coord_shift[2]) / d_voxel_size[2]);
-                                        
-                    centerx = sample_loc[index * 3];
-                    centery = sample_loc[index * 3 + 1];
-                    centerz = sample_loc[index * 3 + 2];
-                                        
-                    int kid = 0, far_ind = 0, coor_z, coor_y, coor_x;
-                    float far2 = 0.0;
-                    float xyz2Buffer[KN];
-                    for (int layer = 0; layer < (kernel_size[0]+1)/2; layer++){                        
-                        for (int x = max(-frustx, -layer); x < min(d_grid_size[0] - frustx, layer + 1); x++) {
-                            coor_x = frustx + x;
-                            for (int y = max(-frusty, -layer); y < min(d_grid_size[1] - frusty, layer + 1); y++) {
-                                coor_y = frusty + y;
-                                for (int z =  max(-frustz, -layer); z < min(d_grid_size[2] - frustz, layer + 1); z++) {
-                                    coor_z = z + frustz;
-                                    if (max(abs(z), max(abs(x), abs(y))) != layer) continue;
-                                    int coor_indx_b = i_batch * grid_size_vol + coor_x * (d_grid_size[1] * d_grid_size[2]) + coor_y * d_grid_size[2] + coor_z;
-                                    int occ_indx = coor_2_occ[coor_indx_b] + i_batch * max_o;
-                                    if (occ_indx >= 0) {
-                                        for (int g = 0; g < min(P, occ_numpnts[occ_indx]); g++) {
-                                            int pidx = occ_2_pnts[occ_indx * P + g];
-                                            float x_v = (in_data[pidx*3]-centerx);
-                                            float y_v = (in_data[pidx*3 + 1]-centery);
-                                            float z_v = (in_data[pidx*3 + 2]-centerz);
-                                            float xyz2 = x_v * x_v + y_v * y_v + z_v * z_v;
-                                            if ((radius_limit2 == 0 || xyz2 <= radius_limit2)){
-                                                if (kid++ < K) {
-                                                    sample_pidx[index * K + kid - 1] = pidx;
-                                                    xyz2Buffer[kid-1] = xyz2;
-                                                    if (xyz2 > far2){
-                                                        far2 = xyz2;
-                                                        far_ind = kid - 1;
-                                                    }
-                                                } else {
-                                                    if (xyz2 < far2) {
-                                                        sample_pidx[index * K + far_ind] = pidx;
-                                                        xyz2Buffer[far_ind] = xyz2;
-                                                        far2 = xyz2;
-                                                        for (int i = 0; i < K; i++) {
-                                                            if (xyz2Buffer[i] > far2) {
-                                                                far2 = xyz2Buffer[i];
-                                                                far_ind = i;
-                                                            }
-                                                        }
-                                                    } 
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if (kid >= K) break;
-                    }
-                }
-            }
-        """, no_extern_c=True)
-        claim_occ = mod.get_function("claim_occ")
-        map_coor2occ = mod.get_function("map_coor2occ")
-        fill_occ2pnts = mod.get_function("fill_occ2pnts")
-        mask_raypos = mod.get_function("mask_raypos")
-        get_shadingloc = mod.get_function("get_shadingloc")
-        query_along_ray = mod.get_function("query_neigh_along_ray_layered") if self.opt.NN > 0 else mod.get_function("query_rand_along_ray")
-        return claim_occ, map_coor2occ, fill_occ2pnts, mask_raypos, get_shadingloc, query_along_ray
-
-
     def switch_pixel_id(self, pixel_idx_tensor, h):
         pixel_id = torch.cat([pixel_idx_tensor[..., 0:1], h - 1 - pixel_idx_tensor[..., 1:2]], dim=-1)
         # print("pixel_id", pixel_id.shape, torch.min(pixel_id, dim=-2)[0], torch.max(pixel_id, dim=-2)[0])
         return pixel_id
-
 
     def build_occ_vox(self, point_xyz_w_tensor, actual_numpoints_tensor, B, N, P, max_o, scaled_vdim_np, kMaxThreadsPerBlock, gridSize, scaled_vsize_gpu, scaled_vdim_gpu, kernel_size_gpu, grid_size_vol, d_coord_shift):
         device = point_xyz_w_tensor.device
@@ -545,60 +122,25 @@ class lighting_fast_querier():
         occ_numpnts_tensor = torch.zeros([B, max_o], dtype=torch.int32, device=device)
         coor_2_occ_tensor = torch.full([B, scaled_vdim_np[0], scaled_vdim_np[1], scaled_vdim_np[2]], -1, dtype=torch.int32, device=device)
         occ_idx_tensor = torch.zeros([B], dtype=torch.int32, device=device)
-        seconds = time.time()
+        seconds = np.uint64(time.time())
 
-        self.claim_occ(
-            Holder(point_xyz_w_tensor),
-            Holder(actual_numpoints_tensor),
-            np.int32(B),
-            np.int32(N),
-            d_coord_shift,
-            scaled_vsize_gpu,
-            scaled_vdim_gpu,
-            np.int32(grid_size_vol),
-            np.int32(max_o),
-            Holder(occ_idx_tensor),
-            Holder(coor_2_occ_tensor),
-            Holder(occ_2_coor_tensor),
-            np.uint64(seconds),
-            block=(kMaxThreadsPerBlock, 1, 1), grid=(gridSize, 1))
-        # torch.cuda.synchronize()
+        _ext.claim_occ(point_xyz_w_tensor, actual_numpoints_tensor, B, N, 
+                             d_coord_shift, scaled_vsize_gpu, scaled_vdim_gpu, grid_size_vol, max_o,
+                             occ_idx_tensor, coor_2_occ_tensor, occ_2_coor_tensor, seconds)
         coor_2_occ_tensor = torch.full([B, scaled_vdim_np[0], scaled_vdim_np[1], scaled_vdim_np[2]], -1,
                                        dtype=torch.int32, device=device)
-        gridSize = int((B * max_o + kMaxThreadsPerBlock - 1) / kMaxThreadsPerBlock)
-        self.map_coor2occ(
-            np.int32(B),
-            scaled_vdim_gpu,
-            kernel_size_gpu,
-            np.int32(grid_size_vol),
-            np.int32(max_o),
-            Holder(occ_idx_tensor),
-            Holder(coor_occ_tensor),
-            Holder(coor_2_occ_tensor),
-            Holder(occ_2_coor_tensor),
-            block=(kMaxThreadsPerBlock, 1, 1), grid=(gridSize, 1))
-        # torch.cuda.synchronize()
-        seconds = time.time()
 
-        gridSize = int((B * N + kMaxThreadsPerBlock - 1) / kMaxThreadsPerBlock)
-        self.fill_occ2pnts(
-            Holder(point_xyz_w_tensor),
-            Holder(actual_numpoints_tensor),
-            np.int32(B),
-            np.int32(N),
-            np.int32(P),
-            d_coord_shift,
-            scaled_vsize_gpu,
-            scaled_vdim_gpu,
-            np.int32(grid_size_vol),
-            np.int32(max_o),
-            Holder(coor_2_occ_tensor),
-            Holder(occ_2_pnts_tensor),
-            Holder(occ_numpnts_tensor),
-            np.uint64(seconds),
-            block=(kMaxThreadsPerBlock, 1, 1), grid=(gridSize, 1))
         # torch.cuda.synchronize()
-
+        _ext.map_coor2occ(B, scaled_vdim_gpu, kernel_size_gpu, grid_size_vol, max_o, 
+                            occ_idx_tensor,coor_occ_tensor,coor_2_occ_tensor,occ_2_coor_tensor)
+        seconds = np.uint64(time.time())
+        # torch.cuda.synchronize()
+        _ext.fill_occ2pnts(
+            point_xyz_w_tensor, actual_numpoints_tensor, B, N, P,
+            d_coord_shift, scaled_vsize_gpu, scaled_vdim_gpu, 
+            grid_size_vol, max_o,
+            coor_2_occ_tensor, occ_2_pnts_tensor, occ_numpnts_tensor,
+            seconds)
         return coor_occ_tensor, occ_2_coor_tensor, coor_2_occ_tensor, occ_idx_tensor, occ_numpnts_tensor, occ_2_pnts_tensor
 
 
@@ -619,23 +161,17 @@ class lighting_fast_querier():
         # print("coor_occ_tensor", torch.min(coor_occ_tensor), torch.max(coor_occ_tensor), torch.min(occ_2_coor_tensor), torch.max(occ_2_coor_tensor), torch.min(coor_2_occ_tensor), torch.max(coor_2_occ_tensor), torch.min(occ_idx_tensor), torch.max(occ_idx_tensor), torch.min(occ_numpnts_tensor), torch.max(occ_numpnts_tensor), torch.min(occ_2_pnts_tensor), torch.max(occ_2_pnts_tensor), occ_2_pnts_tensor.shape)
         # print("occ_numpnts_tensor", torch.sum(occ_numpnts_tensor > 0), ranges_np)
         # vis_vox(ranges_np, scaled_vsize_np, coor_2_occ_tensor)
-
         raypos_mask_tensor = torch.zeros([B, R, D], dtype=torch.int32, device=device)
-        gridSize = int((B * R * D + kMaxThreadsPerBlock - 1) / kMaxThreadsPerBlock)
-        self.mask_raypos(
-            Holder(raypos_tensor),  # [1, 2048, 400, 3]
-            Holder(coor_occ_tensor),  # [1, 2048, 400, 3]
-            np.int32(B),
-            np.int32(R),
-            np.int32(D),
-            np.int32(grid_size_vol),
+        
+        _ext.mask_raypos(
+            raypos_tensor,  # [1, 2048, 400, 3]
+            coor_occ_tensor,  # [1, 2048, 400, 3]
+            B, R, D, grid_size_vol, 
             d_coord_shift,
             scaled_vdim_gpu,
             scaled_vsize_gpu,
-            Holder(raypos_mask_tensor),
-            block=(kMaxThreadsPerBlock, 1, 1), grid=(gridSize, 1)
+            raypos_mask_tensor
         )
-
         # torch.cuda.synchronize()
         # print("raypos_mask_tensor", raypos_mask_tensor.shape, torch.sum(coor_occ_tensor), torch.sum(raypos_mask_tensor))
         # save_points(raypos_tensor.reshape(-1, 3), "./", "rawraypos_pnts")
@@ -643,8 +179,7 @@ class lighting_fast_querier():
         # save_points(raypos_masked.reshape(-1, 3), "./", "raypos_pnts")
 
         ray_mask_tensor = torch.max(raypos_mask_tensor, dim=-1)[0] > 0 # B, R
-        R = torch.sum(ray_mask_tensor.to(torch.int32)).cpu().numpy()
-        # print("R", torch.sum(ray_mask_tensor.to(torch.int32)), R)
+        R = torch.max(torch.sum(ray_mask_tensor.to(torch.int32))).cpu().numpy()
         sample_loc_tensor = torch.zeros([B, R, SR, 3], dtype=torch.float32, device=device)
         sample_pidx_tensor = torch.full([B, R, SR, K], -1, dtype=torch.int32, device=device)
         if R > 0:
@@ -655,48 +190,35 @@ class lighting_fast_querier():
             raypos_maskcum = torch.cumsum(raypos_mask_tensor, dim=-1).to(torch.int32)
             raypos_mask_tensor = (raypos_mask_tensor * raypos_maskcum * (raypos_maskcum <= SR)) - 1
             sample_loc_mask_tensor = torch.zeros([B, R, SR], dtype=torch.int32, device=device)
-            self.get_shadingloc(
-                Holder(raypos_tensor),  # [1, 2048, 400, 3]
-                Holder(raypos_mask_tensor),
-                np.int32(B),
-                np.int32(R),
-                np.int32(D),
-                np.int32(SR),
-                Holder(sample_loc_tensor),
-                Holder(sample_loc_mask_tensor),
-                block=(kMaxThreadsPerBlock, 1, 1), grid=(gridSize, 1)
+            _ext.get_shadingloc(
+                raypos_tensor,  # [1, 2048, 400, 3]
+                raypos_mask_tensor, 
+                B, R, D, SR,
+                sample_loc_tensor,
+                sample_loc_mask_tensor
             )
-
             # torch.cuda.synchronize()
             # print("shadingloc_mask_tensor", torch.sum(sample_loc_mask_tensor, dim=-1), torch.sum(torch.sum(sample_loc_mask_tensor, dim=-1) > 0), torch.sum(sample_loc_mask_tensor > 0))
             # shadingloc_masked = torch.masked_select(sample_loc_tensor, sample_loc_mask_tensor[..., None] > 0)
             # save_points(shadingloc_masked.reshape(-1, 3), "./", "shading_pnts{}".format(self.count))
 
-            seconds = time.time()
-            gridSize = int((B * R * SR + kMaxThreadsPerBlock - 1) / kMaxThreadsPerBlock)
-            self.query_along_ray(
-                Holder(point_xyz_w_tensor),
-                np.int32(B),
-                np.int32(SR),
-                np.int32(R),
-                np.int32(max_o),
-                np.int32(P),
-                np.int32(K),
-                np.int32(grid_size_vol),
-                np.float32(radius_limit_np ** 2),
+            seconds = np.uint64(time.time())
+            _ext.query_along_ray(
+                point_xyz_w_tensor, 
+                B, SR, R, max_o, P, K, grid_size_vol,
+                radius_limit_np ** 2,
                 d_coord_shift,
                 scaled_vdim_gpu,
                 scaled_vsize_gpu,
                 kernel_size_gpu,
-                Holder(occ_numpnts_tensor),
-                Holder(occ_2_pnts_tensor),
-                Holder(coor_2_occ_tensor),
-                Holder(sample_loc_tensor),
-                Holder(sample_loc_mask_tensor),
-                Holder(sample_pidx_tensor),
-                np.uint64(seconds),
-                np.int32(self.opt.NN),
-                block=(kMaxThreadsPerBlock, 1, 1), grid=(gridSize, 1))
+                occ_numpnts_tensor,
+                occ_2_pnts_tensor,
+                coor_2_occ_tensor,
+                sample_loc_tensor,
+                sample_loc_mask_tensor,
+                sample_pidx_tensor,
+                seconds, self.opt.NN
+            )
             # torch.cuda.synchronize()
             # print("point_xyz_w_tensor",point_xyz_w_tensor.shape)
             # queried_masked = point_xyz_w_tensor[0][sample_pidx_tensor.reshape(-1).to(torch.int64), :]
@@ -721,16 +243,6 @@ def load_pnts(point_path, point_num):
           np.max(point_xyz, axis=0))
     np.random.shuffle(point_xyz)
     return point_xyz[:min(len(point_xyz), point_num), :]
-
-
-def np_to_gpuarray(*args):
-    result = []
-    for x in args:
-        if isinstance(x, np.ndarray):
-            result.append(pycuda.gpuarray.to_gpu(x))
-        else:
-            print("trans",x)
-    return result
 
 
 def save_points(xyz, dir, filename):
@@ -908,12 +420,3 @@ if __name__ == "__main__":
     gpu = 0
     imgidx = 3
     split = ["train"]
-
-    if gpu < 0:
-        import pycuda.autoinit
-    else:
-        drv.init()
-        dev1 = drv.Device(gpu)
-        ctx1 = dev1.make_context()
-    try_build(ranges, vsize, vdim, vscale, max_o, P, kernel_size, SR, K, pixel_idx, obj,
-              radius_limit, depth_limit, near_depth, far_depth, shading_count, split=split, imgidx=imgidx, gpu=0, NN=NN)
